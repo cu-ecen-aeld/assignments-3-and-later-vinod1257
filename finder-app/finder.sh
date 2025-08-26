@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Check if both arguments are provided
 if [ $# -lt 2 ]; then
