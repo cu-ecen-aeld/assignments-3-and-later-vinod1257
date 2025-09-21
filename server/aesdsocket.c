@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -10,9 +11,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "queue.h"
 
 #ifndef INET6_ADDRSTRLEN
 #define INET6_ADDRSTRLEN 46
@@ -25,10 +30,22 @@
 
 static volatile sig_atomic_t exit_requested = 0;
 static int listen_fd = -1;
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void handle_signal(int sig)
-{
+struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr peer_addr;
+    socklen_t peer_len;
+    bool thread_complete;
+    SLIST_ENTRY(thread_data) entries;
+};
+
+SLIST_HEAD(thread_list_head, thread_data) thread_list;
+
+static void handle_signal(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
+        syslog(LOG_INFO, "Caught signal, exiting");
         exit_requested = 1;
         if (listen_fd != -1) {
             close(listen_fd); // unblock accept()
@@ -37,8 +54,7 @@ static void handle_signal(int sig)
     }
 }
 
-static int install_signal_handlers(void)
-{
+static int install_signal_handlers(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
@@ -48,8 +64,7 @@ static int install_signal_handlers(void)
 }
 
 /* Create, bind and listen socket on PORT_STR. */
-static int setup_listen_socket(void)
-{
+static int setup_listen_socket(void) {
     struct addrinfo hints;
     struct addrinfo *res = NULL, *p;
     int rv, fd = -1;
@@ -102,59 +117,51 @@ static int setup_listen_socket(void)
 }
 
 /* Append len bytes from buf to DATAFILE. Return 0 success, -1 error */
-static int append_to_datafile(const char *buf, size_t len)
-{
+static int append_to_datafile(const char *buf, size_t len) {
+    // This function now assumes the caller holds the mutex
     int fd = open(DATAFILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) return -1;
 
-    size_t written = 0;
-    while (written < len) {
-        ssize_t w = write(fd, buf + written, len - written);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            return -1;
-        }
-        written += (size_t)w;
-    }
+    ssize_t bytes_written = write(fd, buf, len);
     close(fd);
-    return 0;
+    return (bytes_written == -1) ? -1 : 0;
 }
 
 /* Send the entire DATAFILE to client_fd. */
-static int send_file_to_client(int client_fd)
-{
+static int send_file_to_client(int client_fd) {
+    // This function now assumes the caller holds the mutex
     int fd = open(DATAFILE, O_RDONLY);
     if (fd < 0) {
         if (errno == ENOENT) return 0; // nothing to send yet
         return -1;
     }
 
-    char buf[RECV_CHUNK];
-    ssize_t r;
-    while ((r = read(fd, buf, sizeof(buf))) > 0) {
-        ssize_t off = 0;
-        while (off < r) {
-            ssize_t s = send(client_fd, buf + off, r - off, 0);
-            if (s <= 0) {
-                if (errno == EINTR) continue;
-                close(fd);
-                return -1;
+    char read_buf[RECV_CHUNK];
+    ssize_t bytes_read;
+    while ((bytes_read = read(fd, read_buf, sizeof(read_buf))) > 0) {
+        ssize_t bytes_sent = send(client_fd, read_buf, bytes_read, 0);
+        if (bytes_sent == -1) {
+            // EPIPE means client disconnected, which is normal for the test script
+            if (errno != EPIPE) {
+                syslog(LOG_ERR, "send() to client %d failed: %s", client_fd, strerror(errno));
             }
-            off += s;
+            close(fd);
+            return -1;
         }
     }
     close(fd);
-    if (r < 0) return -1;
+    if (bytes_read < 0) {
+        syslog(LOG_ERR, "read() from datafile failed: %s", strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
 /* Get printable peer IP string from address */
-static void sockaddr_to_ipstr(struct sockaddr *sa, socklen_t salen, char *out, size_t outlen)
-{
+static void sockaddr_to_ipstr(struct sockaddr *sa, socklen_t salen, char *out, size_t outlen) {
     if (!sa) {
         strncpy(out, "unknown", outlen);
-        out[outlen-1] = '\0';
+        out[outlen - 1] = '\0';
         return;
     }
     if (sa->sa_family == AF_INET) {
@@ -165,22 +172,22 @@ static void sockaddr_to_ipstr(struct sockaddr *sa, socklen_t salen, char *out, s
         inet_ntop(AF_INET6, &sin6->sin6_addr, out, outlen);
     } else {
         strncpy(out, "unknown", outlen);
-        out[outlen-1] = '\0';
+        out[outlen - 1] = '\0';
     }
 }
 
 /*
- * handle_client:
+ * handle_client_connection:
  *  - accumulates incoming bytes into a dynamic buffer
  *  - whenever a newline '\n' is observed, extract only that packet (up to and including '\n')
  *    and append to DATAFILE exactly once
  *  - after appending a packet, send the entire DATAFILE contents back to the client
  *  - continue processing additional packets if client sends them in the same connection
  */
-static void handle_client(int client_fd, struct sockaddr *peer_addr, socklen_t peer_len)
-{
+static void *handle_client_connection(void *arg) {
+    struct thread_data *td = (struct thread_data *)arg;
     char ipstr[INET6_ADDRSTRLEN] = {0};
-    sockaddr_to_ipstr(peer_addr, peer_len, ipstr, sizeof(ipstr));
+    sockaddr_to_ipstr(&td->peer_addr, td->peer_len, ipstr, sizeof(ipstr));
     syslog(LOG_INFO, "Accepted connection from %s", ipstr);
 
     size_t buf_cap = RECV_CHUNK;
@@ -188,15 +195,15 @@ static void handle_client(int client_fd, struct sockaddr *peer_addr, socklen_t p
     char *buf = malloc(buf_cap);
     if (!buf) {
         syslog(LOG_ERR, "malloc failed");
-        close(client_fd);
-        return;
+        close(td->client_fd);
+        return NULL;
     }
 
     char rbuf[RECV_CHUNK];
     bool conn_closed = false;
 
-    while (!conn_closed) {
-        ssize_t r = recv(client_fd, rbuf, sizeof(rbuf), 0);
+    while (!conn_closed && !exit_requested) {
+        ssize_t r = recv(td->client_fd, rbuf, sizeof(rbuf), 0);
         if (r == 0) {
             // client closed connection
             conn_closed = true;
@@ -218,8 +225,8 @@ static void handle_client(int client_fd, struct sockaddr *peer_addr, socklen_t p
                 if (!tmp) {
                     syslog(LOG_ERR, "realloc failed");
                     free(buf);
-                    close(client_fd);
-                    return;
+                    close(td->client_fd);
+                    return NULL;
                 }
                 buf = tmp;
                 buf_cap = newcap;
@@ -236,13 +243,22 @@ static void handle_client(int client_fd, struct sockaddr *peer_addr, socklen_t p
 
                 // Now buf[0..buf_len-1] holds one complete packet -> append only this packet
                 if (buf_len > 0) {
+                    if (pthread_mutex_lock(&file_mutex) != 0) {
+                        syslog(LOG_ERR, "Failed to lock mutex");
+                        conn_closed = true; // break outer loop
+                        continue;
+                    }
+
                     if (append_to_datafile(buf, buf_len) != 0) {
                         syslog(LOG_ERR, "append_to_datafile failed: %s", strerror(errno));
-                    } else {
-                        // send full file back to client
-                        if (send_file_to_client(client_fd) != 0) {
-                            syslog(LOG_ERR, "send_file_to_client failed to %s", ipstr);
-                        }
+                    }
+
+                    if (send_file_to_client(td->client_fd) != 0) {
+                         // This can fail if client disconnects; not necessarily an error
+                    }
+
+                    if (pthread_mutex_unlock(&file_mutex) != 0) {
+                        syslog(LOG_ERR, "Failed to unlock mutex");
                     }
                 }
                 // reset buffer to hold any further bytes (remaining bytes after this newline will be processed in the same loop)
@@ -255,15 +271,49 @@ static void handle_client(int client_fd, struct sockaddr *peer_addr, socklen_t p
                 pos += chunk_len;
             }
         } // end inner loop processing this recv chunk
-    } // end recv loop
+    }     // end recv loop
 
     free(buf);
     syslog(LOG_INFO, "Closed connection from %s", ipstr);
-    close(client_fd);
+    close(td->client_fd);
+    td->thread_complete = true;
+
+    return NULL;
 }
 
-int main(int argc, char *argv[])
-{
+static void *timestamp_thread(void *arg) {
+    (void)arg; // suppress unused parameter warning
+    time_t timer;
+    char time_buf[100];
+    struct tm *tm_info;
+
+    while (!exit_requested) {
+        sleep(10);
+        if (exit_requested) break;
+
+        time(&timer);
+        tm_info = localtime(&timer);
+
+        strftime(time_buf, sizeof(time_buf), "timestamp:%a, %d %b %Y %T %z\n", tm_info);
+
+        if (pthread_mutex_lock(&file_mutex) != 0) {
+            syslog(LOG_ERR, "Failed to lock mutex");
+            continue;
+        }
+
+        // The append function is now simplified and doesn't manage the lock
+        int fd = open(DATAFILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        if (fd >= 0) {
+            write(fd, time_buf, strlen(time_buf));
+            close(fd);
+        }
+
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
     bool daemon_mode = false;
     if (argc == 2 && strcmp(argv[1], "-d") == 0) daemon_mode = true;
     else if (argc > 1) {
@@ -319,6 +369,15 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Initialize thread list
+    SLIST_INIT(&thread_list);
+
+    // Create timestamp thread
+    pthread_t timer_thread;
+    if (pthread_create(&timer_thread, NULL, timestamp_thread, NULL) != 0) {
+        syslog(LOG_ERR, "Failed to create timestamp thread");
+    }
+
     while (!exit_requested) {
         struct sockaddr_storage client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -330,12 +389,54 @@ int main(int argc, char *argv[])
             break;
         }
 
-        handle_client(client_fd, (struct sockaddr *)&client_addr, addr_len);
+        // Create thread data
+        struct thread_data *td = malloc(sizeof(struct thread_data));
+        if (!td) {
+            syslog(LOG_ERR, "malloc failed");
+            close(client_fd);
+            continue;
+        }
+        td->client_fd = client_fd;
+        td->thread_id = 0; // Will be filled by pthread_create
+        td->thread_complete = false;
+        memcpy(&td->peer_addr, &client_addr, addr_len);
+        td->peer_len = addr_len;
+
+        // Create thread
+        if (pthread_create(&td->thread_id, NULL, handle_client_connection, td) != 0) {
+            syslog(LOG_ERR, "Failed to create thread");
+            close(client_fd);
+            free(td);
+            continue;
+        }
+
+        // Add thread to list
+        SLIST_INSERT_HEAD(&thread_list, td, entries);
     }
 
-    syslog(LOG_INFO, "Caught signal, exiting");
+    // Cancel timer thread
+    exit_requested = 1;
+    pthread_join(timer_thread, NULL);
+
+    // Join and clean up all client threads
+    struct thread_data *td, *tmp;
+    SLIST_FOREACH_SAFE(td, &thread_list, entries, tmp) {
+        pthread_join(td->thread_id, NULL);
+        free(td);
+    }
+    // This second loop is a safety net for any threads that completed
+    // but were not cleaned up in the main accept loop.
+    while(!SLIST_EMPTY(&thread_list)) {
+        td = SLIST_FIRST(&thread_list);
+        SLIST_REMOVE_HEAD(&thread_list, entries);
+        free(td);
+    }
+
+
+    syslog(LOG_INFO, "Exiting");
     if (listen_fd != -1) close(listen_fd);
     unlink(DATAFILE);
+    pthread_mutex_destroy(&file_mutex);
     closelog();
     return 0;
 }
