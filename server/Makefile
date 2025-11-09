@@ -1,5 +1,5 @@
 CC = $(CROSS_COMPILE)gcc
-CFLAGS =
+CFLAGS = -DUSE_AESD_CHAR_DEVICE=1
 
 all: aesdsocket
 default: aesdsocket

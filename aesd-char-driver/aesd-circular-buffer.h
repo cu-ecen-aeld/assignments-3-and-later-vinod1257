@@ -10,13 +10,27 @@
 
 #ifdef __KERNEL__
 #include <linux/types.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/kernel.h>
+#include <linux/printk.h>
 #else
 #include <stddef.h> // size_t
 #include <stdint.h> // uintx_t
 #include <stdbool.h>
+#include <string.h>
+#include <stdio.h>   
 #endif
 
-#define AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED 10
+/* Make a single canonical macro name and keep older name as alias if present */
+#ifndef AESDCHAR_MAX_CIRCULAR_BUFFER_SIZE
+#define AESDCHAR_MAX_CIRCULAR_BUFFER_SIZE 10   /* or whatever your desired value is */
+#endif
+
+/* keep older name alias for compatibility */
+#ifndef AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED
+#define AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED AESDCHAR_MAX_CIRCULAR_BUFFER_SIZE
+#endif
 
 struct aesd_buffer_entry
 {

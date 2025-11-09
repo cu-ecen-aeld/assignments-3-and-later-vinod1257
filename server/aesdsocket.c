@@ -25,12 +25,20 @@
 
 #define PORT_STR "9000"
 #define BACKLOG 10
+
+#ifdef USE_AESD_CHAR_DEVICE
+#define DATAFILE "/dev/aesdchar"
+#else
 #define DATAFILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define RECV_CHUNK 1024
 
 static volatile sig_atomic_t exit_requested = 0;
 static int listen_fd = -1;
+#ifndef USE_AESD_CHAR_DEVICE
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 struct thread_data {
     pthread_t thread_id;
@@ -118,8 +126,7 @@ static int setup_listen_socket(void) {
 
 /* Append len bytes from buf to DATAFILE. Return 0 success, -1 error */
 static int append_to_datafile(const char *buf, size_t len) {
-    // This function now assumes the caller holds the mutex
-    int fd = open(DATAFILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    int fd = open(DATAFILE, O_WRONLY | O_APPEND);
     if (fd < 0) return -1;
 
     ssize_t bytes_written = write(fd, buf, len);
@@ -129,7 +136,6 @@ static int append_to_datafile(const char *buf, size_t len) {
 
 /* Send the entire DATAFILE to client_fd. */
 static int send_file_to_client(int client_fd) {
-    // This function now assumes the caller holds the mutex
     int fd = open(DATAFILE, O_RDONLY);
     if (fd < 0) {
         if (errno == ENOENT) return 0; // nothing to send yet
@@ -141,7 +147,6 @@ static int send_file_to_client(int client_fd) {
     while ((bytes_read = read(fd, read_buf, sizeof(read_buf))) > 0) {
         ssize_t bytes_sent = send(client_fd, read_buf, bytes_read, 0);
         if (bytes_sent == -1) {
-            // EPIPE means client disconnected, which is normal for the test script
             if (errno != EPIPE) {
                 syslog(LOG_ERR, "send() to client %d failed: %s", client_fd, strerror(errno));
             }
@@ -190,126 +195,86 @@ static void *handle_client_connection(void *arg) {
     sockaddr_to_ipstr(&td->peer_addr, td->peer_len, ipstr, sizeof(ipstr));
     syslog(LOG_INFO, "Accepted connection from %s", ipstr);
 
-    size_t buf_cap = RECV_CHUNK;
-    size_t buf_len = 0;
-    char *buf = malloc(buf_cap);
-    if (!buf) {
-        syslog(LOG_ERR, "malloc failed");
+    char recv_buf[RECV_CHUNK];
+    ssize_t bytes_read;
+
+    // Open /dev/aesdchar lazily
+    syslog(LOG_DEBUG, "Opening %s for read/write", DATAFILE);
+    int data_fd = open(DATAFILE, O_RDWR);
+    if (data_fd == -1) {
+        syslog(LOG_ERR, "Failed to open %s: %s", DATAFILE, strerror(errno));
         close(td->client_fd);
         return NULL;
     }
 
-    char rbuf[RECV_CHUNK];
-    bool conn_closed = false;
+    // Use an in-memory buffer to accumulate all received data
+    size_t buf_size = RECV_CHUNK;
+    size_t buf_len = 0;
+    char *accumulated_data = malloc(buf_size);
+    if (!accumulated_data) {
+        syslog(LOG_ERR, "Failed to allocate memory for accumulated data");
+        close(data_fd);
+        close(td->client_fd);
+        return NULL;
+    }
 
-    while (!conn_closed && !exit_requested) {
-        ssize_t r = recv(td->client_fd, rbuf, sizeof(rbuf), 0);
-        if (r == 0) {
-            // client closed connection
-            conn_closed = true;
+    // Receive data from the client
+    while ((bytes_read = recv(td->client_fd, recv_buf, sizeof(recv_buf), 0)) > 0) {
+        recv_buf[bytes_read] = '\0'; // Null-terminate for logging
+        syslog(LOG_DEBUG, "Received %zd bytes from client: %s", bytes_read, recv_buf);
+
+        // Write received data to /dev/aesdchar
+        syslog(LOG_DEBUG, "Writing %zd bytes to %s: %s", bytes_read, DATAFILE, recv_buf);
+        if (write(data_fd, recv_buf, bytes_read) != bytes_read) {
+            syslog(LOG_ERR, "Failed to write %zd bytes to %s: %s", bytes_read, DATAFILE, strerror(errno));
             break;
         }
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            syslog(LOG_ERR, "recv failed: %s", strerror(errno));
-            break;
+
+        // Accumulate received data in memory
+        if (buf_len + bytes_read > buf_size) {
+            buf_size *= 2;
+            char *new_buf = realloc(accumulated_data, buf_size);
+            if (!new_buf) {
+                syslog(LOG_ERR, "Failed to reallocate memory for accumulated data");
+                break;
+            }
+            accumulated_data = new_buf;
+        }
+        memcpy(accumulated_data + buf_len, recv_buf, bytes_read);
+        buf_len += bytes_read;
+
+        // Read data back from /dev/aesdchar
+        syslog(LOG_DEBUG, "Reading back from %s", DATAFILE);
+        lseek(data_fd, 0, SEEK_SET); // Reset file offset to the beginning
+        char read_buf[RECV_CHUNK];
+        ssize_t read_bytes;
+        while ((read_bytes = read(data_fd, read_buf, sizeof(read_buf))) > 0) {
+            read_buf[read_bytes] = '\0'; // Null-terminate for logging
+            syslog(LOG_DEBUG, "Read %zd bytes from %s: %s", read_bytes, DATAFILE, read_buf);
+
+            // Send the data back to the client
+            syslog(LOG_DEBUG, "Sending %zd bytes to client: %s", read_bytes, read_buf);
+            if (send(td->client_fd, read_buf, read_bytes, 0) == -1) {
+                syslog(LOG_ERR, "Failed to send %zd bytes to client: %s", read_bytes, strerror(errno));
+                break;
+            }
         }
 
-        size_t pos = 0;
-        while (pos < (size_t)r) {
-            // ensure capacity
-            if (buf_len + (r - pos) + 1 > buf_cap) {
-                size_t newcap = buf_cap * 2;
-                while (newcap < buf_len + (r - pos) + 1) newcap *= 2;
-                char *tmp = realloc(buf, newcap);
-                if (!tmp) {
-                    syslog(LOG_ERR, "realloc failed");
-                    free(buf);
-                    close(td->client_fd);
-                    return NULL;
-                }
-                buf = tmp;
-                buf_cap = newcap;
-            }
+        if (read_bytes == -1) {
+            syslog(LOG_ERR, "Failed to read from %s: %s", DATAFILE, strerror(errno));
+        }
+    }
 
-            // find newline in the received chunk
-            char *newline = memchr(rbuf + pos, '\n', r - pos);
-            if (newline) {
-                size_t chunk_len = (size_t)(newline - (rbuf + pos)) + 1; // include newline
-                // append this chunk into buffer
-                memcpy(buf + buf_len, rbuf + pos, chunk_len);
-                buf_len += chunk_len;
-                pos += chunk_len;
+    if (bytes_read == -1) {
+        syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+    }
 
-                // Now buf[0..buf_len-1] holds one complete packet -> append only this packet
-                if (buf_len > 0) {
-                    if (pthread_mutex_lock(&file_mutex) != 0) {
-                        syslog(LOG_ERR, "Failed to lock mutex");
-                        conn_closed = true; // break outer loop
-                        continue;
-                    }
-
-                    if (append_to_datafile(buf, buf_len) != 0) {
-                        syslog(LOG_ERR, "append_to_datafile failed: %s", strerror(errno));
-                    }
-
-                    if (send_file_to_client(td->client_fd) != 0) {
-                         // This can fail if client disconnects; not necessarily an error
-                    }
-
-                    if (pthread_mutex_unlock(&file_mutex) != 0) {
-                        syslog(LOG_ERR, "Failed to unlock mutex");
-                    }
-                }
-                // reset buffer to hold any further bytes (remaining bytes after this newline will be processed in the same loop)
-                buf_len = 0;
-            } else {
-                // no newline in remaining part: copy all and continue recv
-                size_t chunk_len = (size_t)r - pos;
-                memcpy(buf + buf_len, rbuf + pos, chunk_len);
-                buf_len += chunk_len;
-                pos += chunk_len;
-            }
-        } // end inner loop processing this recv chunk
-    }     // end recv loop
-
-    free(buf);
-    syslog(LOG_INFO, "Closed connection from %s", ipstr);
+    syslog(LOG_INFO, "Closing connection from %s", ipstr);
+    free(accumulated_data);
+    close(data_fd);
     close(td->client_fd);
     td->thread_complete = true;
 
-    return NULL;
-}
-
-static void *timestamp_thread(void *arg) {
-    (void)arg; // suppress unused parameter warning
-    time_t timer;
-    char time_buf[100];
-    struct tm *tm_info;
-
-    while (!exit_requested) {
-        sleep(10);
-        if (exit_requested) break;
-
-        time(&timer);
-        tm_info = localtime(&timer);
-
-        strftime(time_buf, sizeof(time_buf), "timestamp:%a, %d %b %Y %T %z\n", tm_info);
-
-        if (pthread_mutex_lock(&file_mutex) != 0) {
-            syslog(LOG_ERR, "Failed to lock mutex");
-            continue;
-        }
-
-        // The append function is now simplified and doesn't manage the lock
-        int fd = open(DATAFILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
-        if (fd >= 0) {
-            write(fd, time_buf, strlen(time_buf));
-            close(fd);
-        }
-
-        pthread_mutex_unlock(&file_mutex);
-    }
     return NULL;
 }
 
@@ -322,16 +287,13 @@ int main(int argc, char *argv[]) {
     }
 
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
+    syslog(LOG_INFO, "Starting aesdsocket application");
 
     if (install_signal_handlers() < 0) {
         syslog(LOG_ERR, "Failed to install signal handlers: %s", strerror(errno));
         closelog();
         return -1;
     }
-
-    // Ensure clean file at startup so tests are idempotent
-    // (remove this unlink if you want to preserve file between server restarts)
-    unlink(DATAFILE);
 
     listen_fd = setup_listen_socket();
     if (listen_fd < 0) {
@@ -340,6 +302,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (daemon_mode) {
+        syslog(LOG_INFO, "Running as daemon");
         pid_t pid = fork();
         if (pid < 0) {
             syslog(LOG_ERR, "fork failed: %s", strerror(errno));
@@ -371,12 +334,6 @@ int main(int argc, char *argv[]) {
 
     // Initialize thread list
     SLIST_INIT(&thread_list);
-
-    // Create timestamp thread
-    pthread_t timer_thread;
-    if (pthread_create(&timer_thread, NULL, timestamp_thread, NULL) != 0) {
-        syslog(LOG_ERR, "Failed to create timestamp thread");
-    }
 
     while (!exit_requested) {
         struct sockaddr_storage client_addr;
@@ -414,29 +371,15 @@ int main(int argc, char *argv[]) {
         SLIST_INSERT_HEAD(&thread_list, td, entries);
     }
 
-    // Cancel timer thread
-    exit_requested = 1;
-    pthread_join(timer_thread, NULL);
-
     // Join and clean up all client threads
     struct thread_data *td, *tmp;
     SLIST_FOREACH_SAFE(td, &thread_list, entries, tmp) {
         pthread_join(td->thread_id, NULL);
         free(td);
     }
-    // This second loop is a safety net for any threads that completed
-    // but were not cleaned up in the main accept loop.
-    while(!SLIST_EMPTY(&thread_list)) {
-        td = SLIST_FIRST(&thread_list);
-        SLIST_REMOVE_HEAD(&thread_list, entries);
-        free(td);
-    }
-
 
     syslog(LOG_INFO, "Exiting");
     if (listen_fd != -1) close(listen_fd);
-    unlink(DATAFILE);
-    pthread_mutex_destroy(&file_mutex);
     closelog();
     return 0;
 }
